@@ -19,13 +19,15 @@ param(
     [switch]$SkipRebootPrompt,
     [switch]$AutoRestart,
     [string]$LogDirectory = '',
-    [switch]$LaunchedFromScript
+    [switch]$LaunchedFromScript,
+    [switch]$DisableSecurityPrep
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:ProductName = 'KovaLabs Windows Tune-Up'
 $script:AutoRestartPreference = [bool]$AutoRestart
+$script:SecurityPrepEnabled = -not [bool]$DisableSecurityPrep
 
 if (-not $LogDirectory) {
     $desktopPath = [Environment]::GetFolderPath('Desktop')
@@ -65,6 +67,7 @@ function Ensure-Administrator {
     if ($Quiet) { $arguments += ' -Quiet' }
     if ($SkipRebootPrompt) { $arguments += ' -SkipRebootPrompt' }
     if ($AutoRestart) { $arguments += ' -AutoRestart' }
+    if ($DisableSecurityPrep) { $arguments += ' -DisableSecurityPrep' }
     $arguments += ' -LaunchedFromScript'
 
     $message = if ($needsAdmin) {
@@ -528,8 +531,56 @@ function Invoke-SystemCleanup {
     Write-Log 'Disk cleanup completed (CleanMgr).' 
 }
 
+function Ensure-AutomaticTimeSync {
+    Write-Log 'Ensuring automatic time synchronization is enabled.'
+    $ntpClientPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient'
+    try {
+        $currentValue = (Get-ItemProperty -Path $ntpClientPath -Name Enabled -ErrorAction Stop).Enabled
+        if ($currentValue -ne 1) {
+            Set-ItemProperty -Path $ntpClientPath -Name Enabled -Value 1 -ErrorAction Stop
+            Write-Log 'Enabled the Windows NTP client (Set time automatically).'
+        }
+    } catch {
+        Write-Log "Unable to verify automatic time sync registry state: $($_.Exception.Message)" -Level WARN
+    }
+
+    $isDomainJoined = $null
+    try {
+        $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        $isDomainJoined = [bool]$computerSystem.PartOfDomain
+    } catch {
+        Write-Log "Unable to determine domain membership: $($_.Exception.Message)" -Level WARN
+    }
+
+    if ($isDomainJoined -eq $false) {
+        $parametersPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters'
+        try {
+            $currentType = (Get-ItemProperty -Path $parametersPath -Name Type -ErrorAction Stop).Type
+            if ($currentType -ne 'NTP') {
+                Set-ItemProperty -Path $parametersPath -Name Type -Value 'NTP' -ErrorAction Stop
+                Write-Log 'Configured Windows Time service to use the NTP client.'
+            }
+        } catch {
+            Write-Log "Unable to confirm Windows Time configuration: $($_.Exception.Message)" -Level WARN
+        }
+    } elseif ($isDomainJoined) {
+        Write-Log 'Domain-joined device detected; leaving Windows Time source configured by the domain.'
+    }
+
+    try {
+        $serviceInfo = Get-CimInstance -ClassName Win32_Service -Filter "Name='W32Time'" -ErrorAction Stop
+        if ($serviceInfo.StartMode -eq 'Disabled') {
+            Set-Service -Name 'W32Time' -StartupType Manual -ErrorAction Stop
+            Write-Log 'Windows Time service startup type reset from Disabled to Manual.'
+        }
+    } catch {
+        Write-Log "Unable to confirm Windows Time service configuration: $($_.Exception.Message)" -Level WARN
+    }
+}
+
 function Invoke-TimeSynchronization {
     Write-Log '----- Time Synchronization -----'
+    Ensure-AutomaticTimeSync
     try {
         $timeService = Get-Service -Name 'W32Time' -ErrorAction Stop
         if ($timeService.Status -ne 'Running') {
@@ -538,6 +589,12 @@ function Invoke-TimeSynchronization {
         }
     } catch {
         Write-Log "Unable to verify or start the Windows Time service: $($_.Exception.Message)" -Level WARN
+    }
+
+    try {
+        Invoke-ExternalCommand -FilePath 'w32tm.exe' -Arguments @('/config','/update') -Activity 'Refreshing Windows Time configuration'
+    } catch {
+        Write-Log "Failed to refresh Windows Time configuration: $($_.Exception.Message)" -Level WARN
     }
 
     try {
@@ -584,7 +641,7 @@ function Invoke-DeviceDecryption {
         Write-Log 'BitLocker has been disabled; full volume decryption has begun.'
     } catch {
         Write-Log "Failed to disable BitLocker and start decryption: $($_.Exception.Message)" -Level ERROR
-        throw
+        return
     }
 }
 
@@ -633,6 +690,13 @@ function Toggle-AutoRestartPreference {
     Write-Host "Automatic Windows Update reboot is now $status." -ForegroundColor Yellow
 }
 
+function Toggle-SecurityPrepPreference {
+    $script:SecurityPrepEnabled = -not $script:SecurityPrepEnabled
+    $status = if ($script:SecurityPrepEnabled) { 'enabled' } else { 'disabled' }
+    Write-Log "Time sync and device decryption $status via menu selection."
+    Write-Host "Time synchronization + device decryption are now $status." -ForegroundColor Yellow
+}
+
 function Show-Menu {
     Write-Host ''
     Write-Host "======== $script:ProductName ========" -ForegroundColor Cyan
@@ -645,6 +709,8 @@ function Show-Menu {
     Write-Host '7) Device decryption only'
     $autoRebootState = if ($script:AutoRestartPreference) { 'ON' } else { 'OFF' }
     Write-Host "8) Toggle automatic Windows Update reboot (Currently: $autoRebootState)"
+    $securityPrepState = if ($script:SecurityPrepEnabled) { 'ON' } else { 'OFF' }
+    Write-Host "9) Toggle time sync + device decryption (Currently: $securityPrepState)"
     Write-Host '0) Exit'
     Write-Host '========================================'
     return Read-Host 'Choose an option'
@@ -663,10 +729,13 @@ $script:WorkPerformed = $false
 
 try {
     Write-Log "Starting $script:ProductName sequence."
+    if (-not $script:SecurityPrepEnabled) {
+        Write-Log 'Time synchronization and device decryption are currently disabled.'
+    }
 
     if ($RunAll) {
         Test-Cancellation
-        Invoke-TuneUp
+        Invoke-TuneUp -IncludeTimeSync:$script:SecurityPrepEnabled -IncludeDeviceDecryption:$script:SecurityPrepEnabled
         $script:WorkPerformed = $true
     } else {
         $stayInMenu = $true
@@ -676,23 +745,23 @@ try {
             $handled = $true
             switch ($selection) {
                 '1' {
-                    Invoke-TuneUp
+                    Invoke-TuneUp -IncludeTimeSync:$script:SecurityPrepEnabled -IncludeDeviceDecryption:$script:SecurityPrepEnabled
                     $script:WorkPerformed = $true
                 }
                 '2' {
-                    Invoke-TuneUp -IncludeStore:$false -IncludeScans:$false -IncludeCleanup:$false
+                    Invoke-TuneUp -IncludeTimeSync:$script:SecurityPrepEnabled -IncludeDeviceDecryption:$script:SecurityPrepEnabled -IncludeStore:$false -IncludeScans:$false -IncludeCleanup:$false
                     $script:WorkPerformed = $true
                 }
                 '3' {
-                    Invoke-TuneUp -IncludeWindowsUpdate:$false -IncludeScans:$false -IncludeCleanup:$false
+                    Invoke-TuneUp -IncludeTimeSync:$script:SecurityPrepEnabled -IncludeDeviceDecryption:$script:SecurityPrepEnabled -IncludeWindowsUpdate:$false -IncludeScans:$false -IncludeCleanup:$false
                     $script:WorkPerformed = $true
                 }
                 '4' {
-                    Invoke-TuneUp -IncludeWindowsUpdate:$false -IncludeStore:$false -IncludeCleanup:$false
+                    Invoke-TuneUp -IncludeTimeSync:$script:SecurityPrepEnabled -IncludeDeviceDecryption:$script:SecurityPrepEnabled -IncludeWindowsUpdate:$false -IncludeStore:$false -IncludeCleanup:$false
                     $script:WorkPerformed = $true
                 }
                 '5' {
-                    Invoke-TuneUp -IncludeWindowsUpdate:$false -IncludeStore:$false -IncludeScans:$false
+                    Invoke-TuneUp -IncludeTimeSync:$script:SecurityPrepEnabled -IncludeDeviceDecryption:$script:SecurityPrepEnabled -IncludeWindowsUpdate:$false -IncludeStore:$false -IncludeScans:$false
                     $script:WorkPerformed = $true
                 }
                 '6' {
@@ -705,6 +774,10 @@ try {
                 }
                 '8' {
                     Toggle-AutoRestartPreference
+                    $handled = $false
+                }
+                '9' {
+                    Toggle-SecurityPrepPreference
                     $handled = $false
                 }
                 '0' {

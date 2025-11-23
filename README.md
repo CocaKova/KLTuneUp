@@ -78,4 +78,4 @@ Pull requests/issues are welcome. Please:
 
 ## License
 
-MIT License © KovaLabs. See `LICENSE` for details.
+This project is distributed under the GNU General Public License v3.0. See `LICENSE` for the full text.

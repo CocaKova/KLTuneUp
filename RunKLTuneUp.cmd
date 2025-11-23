@@ -6,5 +6,7 @@ if not exist "%SCRIPT_DIR%KLTuneUp.ps1" (
     pause
     exit /b 1
 )
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%KLTuneUp.ps1" %*
+:: Pass -LaunchedFromScript so the PowerShell script prompts before exiting.
+:: Also add -NoExit so that the PowerShell host remains open even if the script calls exit.
+powershell.exe -NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File "%SCRIPT_DIR%KLTuneUp.ps1" -LaunchedFromScript %*
 endlocal
